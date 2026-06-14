@@ -424,3 +424,205 @@ func assertSchemaSanitizedAndPropertyPreserved(t *testing.T, params map[string]a
 		t.Fatalf("deprecated should be removed from nested schema")
 	}
 }
+
+func extractFirstFunctionCallArgs(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+
+	request, ok := body["request"].(map[string]any)
+	if !ok {
+		t.Fatalf("request missing or invalid type")
+	}
+	contents, ok := request["contents"].([]any)
+	if !ok || len(contents) == 0 {
+		t.Fatalf("contents missing or empty")
+	}
+	content, ok := contents[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first content element missing or invalid type")
+	}
+	parts, ok := content["parts"].([]any)
+	if !ok || len(parts) == 0 {
+		t.Fatalf("parts missing or empty")
+	}
+	part, ok := parts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first part missing or invalid type")
+	}
+	functionCall, ok := part["functionCall"].(map[string]any)
+	if !ok {
+		t.Fatalf("functionCall missing or invalid type")
+	}
+	args, ok := functionCall["args"].(map[string]any)
+	if !ok {
+		t.Fatalf("args missing or invalid type")
+	}
+
+	return args
+}
+
+func TestAntigravityBuildRequest_PreservesToolCallArgsPattern(t *testing.T) {
+	payload := []byte(`{
+		"request": {
+			"contents": [
+				{
+					"role": "model",
+					"parts": [
+						{
+							"functionCall": {
+								"id": "glob-1",
+								"name": "glob",
+								"args": {
+									"pattern": "**/*"
+								}
+							}
+						}
+					]
+				}
+			],
+			"tools": [
+				{
+					"function_declarations": [
+						{
+							"name": "glob",
+							"description": "Find files",
+							"parametersJsonSchema": {
+								"type": "object",
+								"properties": {
+									"pattern": {
+										"type": "string",
+										"description": "The glob pattern"
+									}
+								},
+								"required": ["pattern"]
+							}
+						}
+					]
+				}
+			]
+		}
+	}`)
+
+	body := buildRequestBodyFromRawPayload(t, "gemini-3.5-flash", payload)
+
+	request, ok := body["request"].(map[string]any)
+	if !ok {
+		t.Fatalf("request missing or invalid type")
+	}
+
+	contents, ok := request["contents"].([]any)
+	if !ok || len(contents) == 0 {
+		t.Fatalf("contents missing or empty")
+	}
+
+	content, ok := contents[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first content element missing or invalid type")
+	}
+
+	parts, ok := content["parts"].([]any)
+	if !ok || len(parts) == 0 {
+		t.Fatalf("parts missing or empty")
+	}
+
+	part, ok := parts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first part missing or invalid type")
+	}
+
+	functionCall, ok := part["functionCall"].(map[string]any)
+	if !ok {
+		t.Fatalf("functionCall missing or invalid type")
+	}
+
+	args, ok := functionCall["args"].(map[string]any)
+	if !ok {
+		t.Fatalf("args missing or invalid type")
+	}
+
+	gotPattern, ok := args["pattern"].(string)
+	if !ok {
+		t.Errorf("args.pattern missing or not a string, got args: %v", args)
+	} else if gotPattern != "**/*" {
+		t.Errorf("args.pattern expected '**/*', got: %q", gotPattern)
+	}
+
+	if desc, ok := args["description"]; ok {
+		t.Errorf("args.description should not exist, but got: %v", desc)
+	}
+}
+
+func TestAntigravityBuildRequest_PreservesGrepToolCallArgsPattern(t *testing.T) {
+	payload := []byte(`{
+		"request": {
+			"contents": [
+				{
+					"role": "model",
+					"parts": [
+						{
+							"functionCall": {
+								"id": "grep-1",
+								"name": "grep",
+								"args": {
+									"pattern": "tags",
+									"path": "api/src",
+									"include": "*.ts"
+								}
+							}
+						}
+					]
+				}
+			],
+			"tools": [
+				{
+					"function_declarations": [
+						{
+							"name": "grep",
+							"description": "Find files",
+							"parametersJsonSchema": {
+								"type": "object",
+								"properties": {
+									"pattern": {
+										"type": "string",
+										"description": "The grep pattern"
+									},
+									"path": {
+										"type": "string"
+									},
+									"include": {
+										"type": "string"
+									}
+								},
+								"required": ["pattern"]
+							}
+						}
+					]
+				}
+			]
+		}
+	}`)
+
+	body := buildRequestBodyFromRawPayload(t, "gemini-3.5-flash", payload)
+	args := extractFirstFunctionCallArgs(t, body)
+
+	if gotPattern, ok := args["pattern"].(string); !ok {
+		t.Fatalf("args.pattern missing or not a string, got args: %v", args)
+	} else if gotPattern != "tags" {
+		t.Fatalf("args.pattern expected %q, got: %q", "tags", gotPattern)
+	}
+
+	if gotPath, ok := args["path"].(string); !ok {
+		t.Fatalf("args.path missing or not a string, got args: %v", args)
+	} else if gotPath != "api/src" {
+		t.Fatalf("args.path expected %q, got: %q", "api/src", gotPath)
+	}
+
+	if gotInclude, ok := args["include"].(string); !ok {
+		t.Fatalf("args.include missing or not a string, got args: %v", args)
+	} else if gotInclude != "*.ts" {
+		t.Fatalf("args.include expected %q, got: %q", "*.ts", gotInclude)
+	}
+
+	if desc, ok := args["description"]; ok {
+		t.Fatalf("args.description should not exist, but got: %v", desc)
+	}
+}

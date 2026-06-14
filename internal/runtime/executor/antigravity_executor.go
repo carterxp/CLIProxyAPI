@@ -2114,29 +2114,18 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		payloadLog []byte
 	)
 	if antigravityRequestNeedsSchemaSanitization(payload) {
-		payloadStr := string(payload)
-		paths := make([]string, 0)
-		util.Walk(gjson.Parse(payloadStr), "", "parametersJsonSchema", &paths)
-		for _, p := range paths {
-			payloadStr, _ = util.RenameKey(payloadStr, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
-		}
-
-		if useAntigravitySchema {
-			payloadStr = util.CleanJSONSchemaForAntigravity(payloadStr)
-		} else {
-			payloadStr = util.CleanJSONSchemaForGemini(payloadStr)
-		}
+		payload = sanitizeAntigravityRequestSchemas(payload, useAntigravitySchema)
 
 		if strings.Contains(modelName, "claude") {
-			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-			payloadStr = string(updated)
+			updated, _ := sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+			payload = updated
 		} else {
-			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
 		}
 
-		bodyReader = strings.NewReader(payloadStr)
+		bodyReader = bytes.NewReader(payload)
 		if e.cfg != nil && e.cfg.RequestLog {
-			payloadLog = []byte(payloadStr)
+			payloadLog = append([]byte(nil), payload...)
 		}
 	} else {
 		if strings.Contains(modelName, "claude") {
@@ -2200,6 +2189,77 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	})
 
 	return httpReq, nil
+}
+
+// sanitizeAntigravityRequestSchemas cleans only schema-bearing nodes in the request body.
+func sanitizeAntigravityRequestSchemas(body []byte, useAntigravitySchema bool) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	cleanSchema := util.CleanJSONSchemaForGemini
+	if useAntigravitySchema {
+		cleanSchema = util.CleanJSONSchemaForAntigravity
+	}
+
+	tools := gjson.GetBytes(body, "request.tools")
+	if tools.IsArray() {
+		for i, tool := range tools.Array() {
+			for _, declarationsKey := range []string{"function_declarations", "functionDeclarations"} {
+				funcDecls := tool.Get(declarationsKey)
+				if !funcDecls.IsArray() {
+					continue
+				}
+				for j, decl := range funcDecls.Array() {
+					for _, schemaKey := range []string{"parameters", "parametersJsonSchema"} {
+						schema := decl.Get(schemaKey)
+						if !schema.Exists() || !schema.IsObject() {
+							continue
+						}
+
+						path := fmt.Sprintf("request.tools.%d.%s.%d.%s", i, declarationsKey, j, schemaKey)
+						if schemaKey == "parametersJsonSchema" {
+							renamePath := strings.TrimSuffix(path, ".parametersJsonSchema") + ".parameters"
+							updated, errRename := util.RenameKey(string(body), path, renamePath)
+							if errRename != nil {
+								log.Errorf("antigravity executor: failed to rename schema path %s to %s: %v", path, renamePath, errRename)
+								continue
+							}
+							body = []byte(updated)
+							path = renamePath
+						}
+
+						cleaned := cleanSchema(gjson.GetBytes(body, path).Raw)
+						updated, errSet := sjson.SetRawBytes(body, path, []byte(cleaned))
+						if errSet != nil {
+							log.Errorf("antigravity executor: failed to set cleaned schema at %s: %v", path, errSet)
+							continue
+						}
+						body = updated
+					}
+				}
+			}
+		}
+	}
+
+	for _, schemaPath := range []string{
+		"request.generationConfig.responseSchema",
+		"request.generationConfig.responseJsonSchema",
+	} {
+		schema := gjson.GetBytes(body, schemaPath)
+		if !schema.Exists() || !schema.IsObject() {
+			continue
+		}
+		cleaned := cleanSchema(schema.Raw)
+		updated, errSet := sjson.SetRawBytes(body, schemaPath, []byte(cleaned))
+		if errSet != nil {
+			log.Errorf("antigravity executor: failed to set cleaned response schema at %s: %v", schemaPath, errSet)
+			continue
+		}
+		body = updated
+	}
+
+	return body
 }
 
 func antigravityRequestNeedsSchemaSanitization(payload []byte) bool {
